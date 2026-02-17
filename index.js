@@ -34,7 +34,6 @@ async function fetchHtml(url) {
 function extractWorkIds(html) {
   const $ = cheerio.load(html);
 
-  // Agarramos links a /works/12345678 (evita depender fuerte del layout)
   const ids = [];
   const seen = new Set();
 
@@ -80,10 +79,8 @@ async function main() {
     return;
   }
 
-  // El search está ordenado por revised_at: el primero debería ser lo más reciente (nuevo o update)
   const newest = ids[0];
 
-  // Primera corrida: no spamear historial. Solo fijar el punto de partida.
   if (!state.lastWorkId) {
     saveState({ lastWorkId: newest });
     console.log(`Initialized state at work ${newest}`);
@@ -102,7 +99,6 @@ async function main() {
     return;
   }
 
-  // Postear del más viejo al más nuevo
   for (const id of newOnes.reverse()) {
     await postToDiscord(`📚 Nuevo en AO3 (según tu búsqueda): ${workUrl(id)}`);
   }
