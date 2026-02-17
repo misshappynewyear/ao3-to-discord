@@ -3,10 +3,11 @@ name: AO3 to Discord
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */12 * * *"  # cada 12 horas
+    - cron: "0 12 * * *"
+    - cron: "0 0 * * *"
 
 permissions:
-  contents: write  # necesario para commitear state.json
+  contents: write
 
 jobs:
   run:
@@ -27,6 +28,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           AO3_SEARCH_URL: ${{ secrets.AO3_SEARCH_URL }}
+          DISCORD_ADMIN_ROLE_ID: ${{ secrets.DISCORD_ADMIN_ROLE_ID }}
         run: node index.js
 
       - name: Commit state.json if changed
