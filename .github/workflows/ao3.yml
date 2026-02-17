@@ -1,0 +1,42 @@
+name: AO3 to Discord
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */12 * * *"  # cada 12 horas
+
+permissions:
+  contents: write  # necesario para commitear state.json
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm install
+
+      - name: Run checker
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          AO3_SEARCH_URL: ${{ secrets.AO3_SEARCH_URL }}
+        run: node index.js
+
+      - name: Commit state.json if changed
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update state"
+            git push
+          fi
