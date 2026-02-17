@@ -1,5 +1,5 @@
 import fs from "fs";
-import cheerio from "cheerio";
+import * as cheerio from "cheerio";
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const AO3_SEARCH_URL = process.env.AO3_SEARCH_URL;
