@@ -26,18 +26,17 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Fetch HTML with retries/backoff to reduce intermittent Cloudflare/GitHub runner issues (e.g., 525)
 async function fetchHtml(url) {
   const maxAttempts = 5;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const u = new URL(url);
-    u.searchParams.set("_", Date.now().toString()); // cache buster
+    u.searchParams.set("_", Date.now().toString());
 
     const res = await fetch(u.toString(), {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; AO3DiscordNotifier/1.0)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
       },
     });
@@ -57,26 +56,37 @@ async function fetchHtml(url) {
   throw new Error("AO3 request failed after retries");
 }
 
-// More specific selector for AO3 works listing
-function extractWorkIds(html) {
+
+// NEW: extract id + title together
+function extractWorks(html) {
   const $ = cheerio.load(html);
 
-  const ids = [];
+  const works = [];
   const seen = new Set();
 
-  $("li.work a[href^='/works/']").each((_, el) => {
-    const href = $(el).attr("href") || "";
+  $("li.work").each((_, el) => {
+    const link = $(el).find("h4.heading a[href^='/works/']").first();
+
+    if (!link.length) return;
+
+    const href = link.attr("href");
+    const title = link.text().trim();
+
     const m = href.match(/\/works\/(\d+)/);
-    if (m) {
-      const id = m[1];
-      if (!seen.has(id)) {
-        seen.add(id);
-        ids.push(id);
-      }
+    if (!m) return;
+
+    const id = m[1];
+
+    if (!seen.has(id)) {
+      seen.add(id);
+      works.push({
+        id,
+        title
+      });
     }
   });
 
-  return ids;
+  return works;
 }
 
 async function postToDiscord(message) {
@@ -85,7 +95,7 @@ async function postToDiscord(message) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       content: message,
-      allowed_mentions: { parse: ["roles"] }, // allow <@&ROLE_ID> mentions
+      allowed_mentions: { parse: ["roles"] },
     }),
   });
 
@@ -107,47 +117,45 @@ async function main() {
   const state = loadState();
 
   const html = await fetchHtml(AO3_SEARCH_URL);
-  const ids = extractWorkIds(html);
+  const works = extractWorks(html);
 
-  // If we cannot parse any work IDs, notify admins (only this special case as requested)
-  if (ids.length === 0) {
-    console.log("No work IDs found (layout change or empty results).");
+  if (works.length === 0) {
+    console.log("No works found.");
     await postToDiscord(
-      `${adminPingPrefix()}⚠️ AO3 notifier ran but found 0 works. The page layout may have changed, results may be empty, or the parser needs updating.`
+      `${adminPingPrefix()}⚠️ AO3 notifier ran but found 0 works. Parser may need updating.`
     );
     return;
   }
 
-  const newest = ids[0];
+  const newest = works[0].id;
 
-  // First run: initialize only (no spam)
   if (!state.lastWorkId) {
     saveState({ lastWorkId: newest });
     console.log(`Initialized state at work ${newest}`);
     return;
   }
 
-  // Collect new IDs until we reach the last seen
-  const newOnes = [];
-  for (const id of ids) {
-    if (id === state.lastWorkId) break;
-    newOnes.push(id);
+  const newWorks = [];
+
+  for (const work of works) {
+    if (work.id === state.lastWorkId) break;
+    newWorks.push(work);
   }
 
-  if (newOnes.length === 0) {
-    console.log("No new works since last check.");
-    // Keep state synced to the newest (helps in case of reordering)
+  if (newWorks.length === 0) {
+    console.log("No new works.");
     saveState({ lastWorkId: newest });
     return;
   }
 
-  // Post oldest -> newest
-  for (const id of newOnes.reverse()) {
-    await postToDiscord(`📚 Nuevo en AO3 (según tu búsqueda): ${workUrl(id)}`);
+  for (const work of newWorks.reverse()) {
+    await postToDiscord(
+      `📚 New fic on AO3. ${work.title} - ${workUrl(work.id)}`
+    );
   }
 
-  saveState({ lastWorkId: newest });
-  console.log(`Updated state to work ${newest}`);
+  saveState({ lastWorkId: newest});
+  console.log(`Updated state to ${newest}`);
 }
 
 main().catch((err) => {
