@@ -3,8 +3,8 @@ name: AO3 to Discord
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12 * * *"
-    - cron: "0 0 * * *"
+    - cron: "0 13 * * *"  
+    - cron: "0 1 * * *" 
 
 permissions:
   contents: write
@@ -12,6 +12,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -42,3 +43,4 @@ jobs:
             git commit -m "Update state"
             git push
           fi
+
