@@ -10,14 +10,20 @@ if (!AO3_SEARCH_URL) throw new Error("Missing AO3_SEARCH_URL secret");
 const STATE_FILE = "./state.json";
 const DISCORD_BATCH_THRESHOLD = 2;
 
-// Solo buscamos "capítulo" en /works/{id} si hay pocos fics nuevos.
-// Si hay muchos, evitamos requests extra a AO3 para que no tarde minutos.
 const DETAILS_THRESHOLD = 3;
 
-// Timeout duro por request a AO3 (evita colgadas largas)
-const AO3_TIMEOUT_MS = 20000;
+// --- AO3 fetch tuning ---
 const MAX_AO3_ATTEMPTS = 4;
+
+// (1) 30s, (2) 60s, (3) 90s, (4) 90s
+const AO3_TIMEOUT_BASE_MS = 30_000;
+const AO3_TIMEOUT_MAX_MS = 90_000;
+
 const MAX_CONCURRENCY = 2;
+
+const RETRY_BACKOFF_BASE_MS = 1500;
+
+const RETRYABLE_HTTP = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525]);
 
 function loadState() {
   try {
@@ -32,46 +38,93 @@ function saveState(state) {
 }
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function workUrl(id) {
   return `https://archiveofourown.org/works/${id}`;
 }
 
-async function fetchHtml(url, { timeoutMs = AO3_TIMEOUT_MS } = {}) {
+function timeoutForAttempt(attempt) {
+  // 30s, 60s, 90s, 90s...
+  return Math.min(AO3_TIMEOUT_BASE_MS * attempt, AO3_TIMEOUT_MAX_MS);
+}
+
+function backoffForAttempt(attempt, extraMs = 0) {
+  // 1: 1500-2500ms, 2: 3000-4500ms, 3: 4500-6500ms...
+  const jitter = Math.floor(Math.random() * 1000);
+  return RETRY_BACKOFF_BASE_MS * attempt + jitter + extraMs;
+}
+
+function addCacheBuster(url) {
+  const u = new URL(url);
+  u.searchParams.set("_", Date.now().toString());
+  return u.toString();
+}
+
+async function fetchHtml(url) {
   for (let attempt = 1; attempt <= MAX_AO3_ATTEMPTS; attempt++) {
+    const timeoutMs = timeoutForAttempt(attempt);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    try {
-      const u = new URL(url);
-      u.searchParams.set("_", Date.now().toString());
+    const requestUrl = addCacheBuster(url);
 
-      const res = await fetch(u.toString(), {
+    try {
+      const res = await fetch(requestUrl, {
         signal: controller.signal,
         headers: {
-          "User-Agent": "Mozilla/5.0 AO3DiscordNotifier",
-          "Accept": "text/html",
-          "Accept-Language": "en-US,en;q=0.9"
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Cache-Control": "no-cache",
+          "Pragma": "no-cache"
         }
       });
 
       if (res.ok) return await res.text();
 
-      const retryable = [429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525].includes(res.status);
+      const retryable = RETRYABLE_HTTP.has(res.status);
+      const bodySnippet = await res.text().catch(() => "");
+      console.error(
+        `[AO3] HTTP ${res.status} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} body=${bodySnippet.slice(
+          0,
+          180
+        ).replace(/\s+/g, " ")}`
+      );
+
       if (!retryable || attempt === MAX_AO3_ATTEMPTS) {
         throw new Error(`AO3 request failed: ${res.status}`);
       }
 
-      await sleep(1500 * attempt);
+      let extra = 0;
+      const ra = res.headers.get("retry-after");
+      if (ra) {
+        const sec = Number(ra);
+        if (!Number.isNaN(sec) && sec > 0) extra = sec * 1000;
+      }
+
+      await sleep(backoffForAttempt(attempt, extra));
     } catch (e) {
+      const name = e?.name || "";
+      const isAbort = name === "AbortError" || name === "AbortErrorEvent" || String(e).includes("AbortError");
+
+      console.error(
+        `[AO3] ${isAbort ? "TIMEOUT/ABORT" : "ERROR"} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} err=${
+          e?.message || e
+        }`
+      );
+
       if (attempt === MAX_AO3_ATTEMPTS) throw e;
-      await sleep(1500 * attempt);
+
+      await sleep(backoffForAttempt(attempt));
     } finally {
       clearTimeout(timer);
     }
   }
+
+  throw new Error("fetchHtml exhausted retries");
 }
 
 function extractWorks(html) {
@@ -90,10 +143,7 @@ function extractWorks(html) {
 
     const title = link.text().trim();
 
-    // El autor suele estar en el listado de resultados (evita requests extra)
-    const author =
-      $el.find("a[rel='author']").first().text().trim() ||
-      "Unknown";
+    const author = $el.find("a[rel='author']").first().text().trim() || "Unknown";
 
     works.push({
       id: idMatch[1],
@@ -129,17 +179,20 @@ async function postToDiscord(message) {
     if (res.ok) return;
 
     if (res.status === 429) {
-      const data = await res.json();
-      await sleep(data.retry_after * 1000 + 150);
+      // Discord: retry_after viene en segundos
+      const data = await res.json().catch(() => ({}));
+      const retryAfterSec = Number(data.retry_after);
+      const waitMs = (Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 1000) + 200;
+      await sleep(waitMs);
       continue;
     }
 
     const t = await res.text().catch(() => "");
     throw new Error(`Discord webhook failed: ${res.status} ${t}`);
   }
-}
 
-// Concurrency limiter simple
+  throw new Error("Discord webhook failed: exhausted retries");
+}
 async function mapLimit(items, limit, fn) {
   const results = new Array(items.length);
   let i = 0;
@@ -176,22 +229,18 @@ async function main() {
 
   const newest = works[0].id;
 
-  // Primer run: solo inicializa state, no postea nada
   if (!state.lastWorkId) {
     saveState({ lastWorkId: newest });
     console.log(`Initialized state at work ${newest}`);
     return;
   }
 
-  // Junta nuevos hasta encontrar el último visto
   const newWorks = [];
   for (const w of works) {
     if (w.id === state.lastWorkId) break;
     newWorks.push(w);
   }
 
-  // Siempre actualizamos state al "newest" aunque no haya nuevos,
-  // porque la lista está ordenada por updated/revised_at.
   if (newWorks.length === 0) {
     saveState({ lastWorkId: newest });
     console.log("No new works since last check.");
@@ -200,34 +249,30 @@ async function main() {
 
   const ordered = newWorks.reverse();
 
-  // Buscar capítulo solo si hay pocos (evita runs lentos)
   const chaptersById = new Map();
   if (ordered.length <= DETAILS_THRESHOLD) {
-    const pairs = await mapLimit(
-      ordered,
-      MAX_CONCURRENCY,
-      async (w) => {
-        const { chapter } = await fetchChapterOnly(w.id);
-        await sleep(250);
-        return [w.id, chapter];
-      }
-    );
+    const pairs = await mapLimit(ordered, MAX_CONCURRENCY, async (w) => {
+      const { chapter } = await fetchChapterOnly(w.id);
+
+      // Respetar un pequeño delay para no martillar AO3
+      await sleep(300);
+
+      return [w.id, chapter];
+    });
+
     for (const [id, ch] of pairs) chaptersById.set(id, ch);
   }
 
-  const lines = ordered.map(w => buildLine(w, chaptersById.get(w.id) || ""));
+  const lines = ordered.map((w) => buildLine(w, chaptersById.get(w.id) || ""));
 
   // Si hay muchos, mandamos un solo mensaje para evitar rate limits
   if (lines.length > DISCORD_BATCH_THRESHOLD) {
-    const message =
-      `📚 New fics on AO3:\n` +
-      lines.map(l => `- ${l}`).join("\n");
-
+    const message = `📚 New fics on AO3:\n` + lines.map((l) => `- ${l}`).join("\n");
     await postToDiscord(message);
   } else {
     for (const line of lines) {
       await postToDiscord(line);
-      await sleep(400);
+      await sleep(450);
     }
   }
 
@@ -235,7 +280,7 @@ async function main() {
   console.log(`Updated state to work ${newest}`);
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
