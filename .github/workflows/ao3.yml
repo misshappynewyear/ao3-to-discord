@@ -3,8 +3,8 @@ name: AO3 to Discord
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 13 * * *"  
-    - cron: "0 1 * * *" 
+    - cron: "0 13 * * *"
+    - cron: "0 1 * * *"
 
 permissions:
   contents: write
@@ -12,7 +12,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -21,9 +20,19 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
 
-      - name: Install deps
-        run: npm install
+      - name: Configure npm retries
+        run: |
+          npm config set registry https://registry.npmjs.org/
+          npm config set fetch-retries 5
+          npm config set fetch-retry-factor 2
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+
+      - name: Install deps (retry once)
+        run: |
+          npm ci --no-audit --no-fund || (sleep 20 && npm ci --no-audit --no-fund)
 
       - name: Run checker
         env:
@@ -43,4 +52,3 @@ jobs:
             git commit -m "Update state"
             git push
           fi
-
