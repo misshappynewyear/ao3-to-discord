@@ -16,20 +16,20 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 1) Node sin cache (porque todavía no hay lockfile)
+      # 1) Node without cache (in case lockfile is missing on first run)
       - name: Setup Node (no cache yet)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      # 2) Generar package-lock.json sin instalar node_modules
+      # 2) Generate package-lock.json (without installing node_modules) if missing
       - name: Generate package-lock.json if missing
         run: |
           if [ ! -f package-lock.json ]; then
             npm install --package-lock-only --no-audit --no-fund
           fi
 
-      # 3) Commit del lockfile si se creó
+      # 3) Commit lockfile if it was created/changed
       - name: Commit lockfile if created
         run: |
           if git diff --quiet; then
@@ -42,7 +42,7 @@ jobs:
             git push
           fi
 
-      # 4) A partir de acá, ya podés usar cache
+      # 4) Now we can use npm cache (requires lockfile)
       - name: Setup Node (with npm cache)
         uses: actions/setup-node@v4
         with:
@@ -65,6 +65,8 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           AO3_SEARCH_URL: ${{ secrets.AO3_SEARCH_URL }}
+          AO3_FEED_URL: ${{ secrets.AO3_FEED_URL }}
+          AO3_EXCLUDE_TAGS: ${{ secrets.AO3_EXCLUDE_TAGS }}
         run: node index.js
 
       - name: Commit state.json if changed
