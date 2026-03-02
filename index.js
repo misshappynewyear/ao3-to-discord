@@ -4,12 +4,12 @@ import { XMLParser } from "fast-xml-parser";
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const AO3_SEARCH_URL = process.env.AO3_SEARCH_URL; // HTML (primary)
-const AO3_FEED_URL = process.env.AO3_FEED_URL;     // Atom (fallback)
+const AO3_FEED_URL = process.env.AO3_FEED_URL; // Atom (fallback)
 
 // Optional: comma-separated tag names to exclude for Atom fallback
 const AO3_EXCLUDE_TAGS = (process.env.AO3_EXCLUDE_TAGS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
 if (!DISCORD_WEBHOOK_URL) throw new Error("Missing DISCORD_WEBHOOK_URL secret");
@@ -47,7 +47,7 @@ function saveState(state) {
 }
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function timeoutForAttempt(attempt) {
@@ -79,8 +79,11 @@ function shouldExcludeByTags(entryTags) {
 /**
  * Fetch text. Returns:
  * - string: success
- * - null: blocked (401/403/418) after attempts (caller should fallback/skip without updating state)
+ * - null: blocked (401/403/418) => caller should fallback/skip WITHOUT updating state
  * Throws on non-retryable errors.
+ *
+ * IMPORTANT CHANGE: if blocked, return null immediately (no long sleeps/retries),
+ * because it won’t be fixed within the same GitHub Actions run.
  */
 async function fetchText(url, { accept = "text/html" } = {}) {
   for (let attempt = 1; attempt <= MAX_AO3_ATTEMPTS; attempt++) {
@@ -94,11 +97,11 @@ async function fetchText(url, { accept = "text/html" } = {}) {
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          "Accept": accept,
+          Accept: accept,
           "Accept-Language": "en-US,en;q=0.9",
           "Cache-Control": "no-cache",
-          "Pragma": "no-cache"
-        }
+          Pragma: "no-cache",
+        },
       });
 
       if (res.ok) return await res.text();
@@ -113,12 +116,8 @@ async function fetchText(url, { accept = "text/html" } = {}) {
           .replace(/\s+/g, " ")}`
       );
 
-      if (blocked) {
-        // cooldown longer; repeated retries in same run rarely fix a block
-        if (attempt === MAX_AO3_ATTEMPTS) return null;
-        await sleep(120_000);
-        continue;
-      }
+      // Key optimization: don’t waste minutes retrying when blocked.
+      if (blocked) return null;
 
       if (!retryable || attempt === MAX_AO3_ATTEMPTS) {
         throw new Error(`AO3 request failed: ${res.status}`);
@@ -176,7 +175,7 @@ function extractWorksFromHtml(html) {
 
 async function fetchChapterOnly(id) {
   const html = await fetchText(`https://archiveofourown.org/works/${id}`, { accept: "text/html" });
-  if (!html) return { chapter: "" }; // blocked; just omit chapter
+  if (!html) return { chapter: "" }; // blocked; omit chapter
 
   const $ = cheerio.load(html);
   let chapter = $("dd.chapters").first().text().trim();
@@ -214,16 +213,16 @@ async function runHtmlPrimary(state) {
 
   const html = await fetchText(AO3_SEARCH_URL, { accept: "text/html" });
   if (!html) {
-    // blocked => let caller fallback to Atom
+    // blocked => fallback to Atom
     return { handled: false, blocked: true };
   }
 
   const works = extractWorksFromHtml(html);
 
+  // Optional improvement: if parsing yields 0, fallback to Atom (instead of “handled”).
   if (works.length === 0) {
-    console.log("AO3 HTML: 0 works found (empty results or layout change).");
-    // Treat as handled (no fallback), because fallback might spam; but you can change this if you want.
-    return { handled: true };
+    console.log("AO3 HTML: 0 works found (empty results, blocked page, or layout change). Falling back to Atom.");
+    return { handled: false };
   }
 
   const newest = works[0].id;
@@ -253,7 +252,7 @@ async function runHtmlPrimary(state) {
     const pairs = await mapLimit(ordered, MAX_CONCURRENCY, async (w) => {
       try {
         const { chapter } = await fetchChapterOnly(w.id);
-        await sleep(300);
+        await sleep(250);
         return [w.id, chapter];
       } catch (e) {
         console.error(`Chapter fetch failed for ${w.id}:`, e?.message || e);
@@ -264,7 +263,7 @@ async function runHtmlPrimary(state) {
     for (const [id, ch] of pairs) chaptersById.set(id, ch);
   }
 
-  const lines = ordered.map(w => buildLineHtml(w, chaptersById.get(w.id) || ""));
+  const lines = ordered.map((w) => buildLineHtml(w, chaptersById.get(w.id) || ""));
   await postLinesToDiscord(lines);
 
   saveState({ ...state, lastWorkId: newest });
@@ -288,30 +287,25 @@ function parseAtom(xml) {
   let entries = feed.entry || [];
   if (!Array.isArray(entries)) entries = [entries];
 
-  return entries.map(e => {
-    // Atom <id> like: tag:archiveofourown.org,2005:work/12345
+  return entries.map((e) => {
     const id = String(e.id || "");
 
-    // Link
     let link = "";
     const links = e.link ? (Array.isArray(e.link) ? e.link : [e.link]) : [];
-    const alt = links.find(l => l["@_rel"] === "alternate") || links[0];
+    const alt = links.find((l) => l["@_rel"] === "alternate") || links[0];
     if (alt?.["@_href"]) link = alt["@_href"];
 
-    // Title
     const rawTitle = e.title && (typeof e.title === "string" ? e.title : e.title["#text"]);
     const title = String(rawTitle || "Untitled").trim();
 
-    // Author
     let author = "Unknown";
     if (e.author) {
       const a = Array.isArray(e.author) ? e.author[0] : e.author;
       if (a?.name) author = String(typeof a.name === "string" ? a.name : a.name["#text"] || author).trim();
     }
 
-    // Tags/categories
     const cats = e.category ? (Array.isArray(e.category) ? e.category : [e.category]) : [];
-    const tags = cats.map(c => c?.["@_term"]).filter(Boolean);
+    const tags = cats.map((c) => c?.["@_term"]).filter(Boolean);
 
     return { id, title, author, link, tags };
   });
@@ -324,7 +318,10 @@ function buildLineAtom(entry) {
 async function runAtomFallback(state) {
   if (!AO3_FEED_URL) return { handled: false };
 
-  const xml = await fetchText(AO3_FEED_URL, { accept: "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8" });
+  const xml = await fetchText(AO3_FEED_URL, {
+    accept: "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+  });
+
   if (!xml) {
     console.log("Atom: AO3 blocked (401/403/418). Skipping run without updating state.");
     return { handled: true, skipped: true };
@@ -356,7 +353,7 @@ async function runAtomFallback(state) {
     return { handled: true };
   }
 
-  const filtered = fresh.filter(e => !shouldExcludeByTags(e.tags));
+  const filtered = fresh.filter((e) => !shouldExcludeByTags(e.tags));
   if (!filtered.length) {
     saveState({ ...state, lastEntryId: newestId });
     console.log("Atom: New entries existed but were excluded. State updated.");
@@ -383,7 +380,7 @@ async function postToDiscord(message) {
     const res = await fetch(DISCORD_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: message })
+      body: JSON.stringify({ content: message }),
     });
 
     if (res.ok) return;
@@ -405,7 +402,7 @@ async function postToDiscord(message) {
 
 async function postLinesToDiscord(lines) {
   if (lines.length > DISCORD_BATCH_THRESHOLD) {
-    const message = `📚 New fics on AO3:\n` + lines.map(l => `- ${l}`).join("\n");
+    const message = `📚 New fics on AO3:\n` + lines.map((l) => `- ${l}`).join("\n");
     await postToDiscord(message);
   } else {
     for (const line of lines) {
@@ -431,7 +428,7 @@ async function main() {
   console.log("Neither AO3_SEARCH_URL nor AO3_FEED_URL were available to run.");
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
