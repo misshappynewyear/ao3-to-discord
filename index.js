@@ -14,13 +14,11 @@ const AO3_EXCLUDE_TAGS = (process.env.AO3_EXCLUDE_TAGS || "")
 
 if (!DISCORD_WEBHOOK_URL) throw new Error("Missing DISCORD_WEBHOOK_URL secret");
 
-// You can run with only Atom by setting only AO3_FEED_URL, but primary expects AO3_SEARCH_URL.
 if (!AO3_SEARCH_URL && !AO3_FEED_URL) {
   throw new Error("Missing AO3_SEARCH_URL and AO3_FEED_URL. Provide at least one.");
 }
 
 const STATE_FILE = "./state.json";
-const DISCORD_BATCH_THRESHOLD = 2;
 const DETAILS_THRESHOLD = 3;
 const MAX_CONCURRENCY = 2;
 
@@ -30,9 +28,12 @@ const AO3_TIMEOUT_BASE_MS = 30_000;
 const AO3_TIMEOUT_MAX_MS = 90_000;
 const RETRY_BACKOFF_BASE_MS = 1500;
 
+// Retryable transient errors
 const RETRYABLE_HTTP = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525]);
-// Treat as “blocked”: we fallback and/or skip run without failing workflow
-const BLOCKED_HTTP = new Set([401, 403, 418]);
+
+// Errors that should NOT break the workflow.
+// We return null and let caller fallback or skip the run without updating state.
+const BLOCKED_HTTP = new Set([401, 403, 418, 525]);
 
 function loadState() {
   try {
@@ -79,11 +80,8 @@ function shouldExcludeByTags(entryTags) {
 /**
  * Fetch text. Returns:
  * - string: success
- * - null: blocked (401/403/418) => caller should fallback/skip WITHOUT updating state
- * Throws on non-retryable errors.
- *
- * IMPORTANT CHANGE: if blocked, return null immediately (no long sleeps/retries),
- * because it won’t be fixed within the same GitHub Actions run.
+ * - null: blocked/unavailable (401/403/418/525) => caller should fallback/skip without updating state
+ * Throws on non-retryable errors after retries.
  */
 async function fetchText(url, { accept = "text/html" } = {}) {
   for (let attempt = 1; attempt <= MAX_AO3_ATTEMPTS; attempt++) {
@@ -116,7 +114,7 @@ async function fetchText(url, { accept = "text/html" } = {}) {
           .replace(/\s+/g, " ")}`
       );
 
-      // Key optimization: don’t waste minutes retrying when blocked.
+      // Do not waste time retrying blocked/unavailable cases inside the same run.
       if (blocked) return null;
 
       if (!retryable || attempt === MAX_AO3_ATTEMPTS) {
@@ -139,14 +137,16 @@ async function fetchText(url, { accept = "text/html" } = {}) {
         `[AO3] ${isAbort ? "TIMEOUT/ABORT" : "ERROR"} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} err=${e?.message || e}`
       );
 
-      if (attempt === MAX_AO3_ATTEMPTS) throw e;
+      // If we already exhausted retries on network timeout/error, skip run cleanly.
+      if (attempt === MAX_AO3_ATTEMPTS) return null;
+
       await sleep(backoffForAttempt(attempt));
     } finally {
       clearTimeout(timer);
     }
   }
 
-  throw new Error("fetchText exhausted retries");
+  return null;
 }
 
 // ---------------- HTML (primary) ----------------
@@ -175,7 +175,7 @@ function extractWorksFromHtml(html) {
 
 async function fetchChapterOnly(id) {
   const html = await fetchText(`https://archiveofourown.org/works/${id}`, { accept: "text/html" });
-  if (!html) return { chapter: "" }; // blocked; omit chapter
+  if (!html) return { chapter: "" };
 
   const $ = cheerio.load(html);
   let chapter = $("dd.chapters").first().text().trim();
@@ -184,7 +184,6 @@ async function fetchChapterOnly(id) {
   return { chapter };
 }
 
-// Concurrency limiter simple
 async function mapLimit(items, limit, fn) {
   const results = new Array(items.length);
   let i = 0;
@@ -213,13 +212,12 @@ async function runHtmlPrimary(state) {
 
   const html = await fetchText(AO3_SEARCH_URL, { accept: "text/html" });
   if (!html) {
-    // blocked => fallback to Atom
     return { handled: false, blocked: true };
   }
 
   const works = extractWorksFromHtml(html);
 
-  // Optional improvement: if parsing yields 0, fallback to Atom (instead of “handled”).
+  // If HTML parsing yields nothing, try Atom fallback instead of pretending success.
   if (works.length === 0) {
     console.log("AO3 HTML: 0 works found (empty results, blocked page, or layout change). Falling back to Atom.");
     return { handled: false };
@@ -323,7 +321,7 @@ async function runAtomFallback(state) {
   });
 
   if (!xml) {
-    console.log("Atom: AO3 blocked (401/403/418). Skipping run without updating state.");
+    console.log("Atom: AO3 blocked/unavailable (401/403/418/525/timeout). Skipping run without updating state.");
     return { handled: true, skipped: true };
   }
 
@@ -354,6 +352,7 @@ async function runAtomFallback(state) {
   }
 
   const filtered = fresh.filter((e) => !shouldExcludeByTags(e.tags));
+
   if (!filtered.length) {
     saveState({ ...state, lastEntryId: newestId });
     console.log("Atom: New entries existed but were excluded. State updated.");
@@ -401,14 +400,9 @@ async function postToDiscord(message) {
 }
 
 async function postLinesToDiscord(lines) {
-  if (lines.length > DISCORD_BATCH_THRESHOLD) {
-    const message = `📚 New fics on AO3:\n` + lines.map((l) => `- ${l}`).join("\n");
-    await postToDiscord(message);
-  } else {
-    for (const line of lines) {
-      await postToDiscord(line);
-      await sleep(450);
-    }
+  for (const line of lines) {
+    await postToDiscord(line);
+    await sleep(450);
   }
 }
 
@@ -422,7 +416,7 @@ async function main() {
   if (htmlResult.handled) return;
 
   // 2) Fallback to Atom
-  const atomResult = await runAtomFallback(loadState()); // reload in case HTML initialized state
+  const atomResult = await runAtomFallback(loadState());
   if (atomResult.handled) return;
 
   console.log("Neither AO3_SEARCH_URL nor AO3_FEED_URL were available to run.");
