@@ -272,7 +272,13 @@ async function runHtmlPrimary(state) {
 
 // ---------------- Atom (fallback) ----------------
 
+function looksLikeAtom(xml) {
+  const s = String(xml || "").trim().toLowerCase();
+  return s.startsWith("<?xml") || s.includes("<feed");
+}
+
 function parseAtom(xml) {
+  
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "@_",
@@ -319,18 +325,24 @@ async function runAtomFallback(state) {
   const xml = await fetchText(AO3_FEED_URL, {
     accept: "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
   });
-
+  
   if (!xml) {
     console.log("Atom: AO3 blocked/unavailable (401/403/418/525/timeout). Skipping run without updating state.");
     return { handled: true, skipped: true };
   }
-
+  
+  // 👇 NUEVO CHECK
+  if (!looksLikeAtom(xml)) {
+    console.error("Atom: response is not valid XML/Atom. Skipping.");
+    return { handled: true, skipped: true };
+  }
+  
   const entries = parseAtom(xml);
+  
   if (!entries.length) {
     console.log("Atom: 0 entries (empty feed or parse change).");
     return { handled: true };
   }
-
   const newestId = entries[0].id;
 
   if (!state.lastEntryId) {
