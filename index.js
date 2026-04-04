@@ -216,6 +216,7 @@ async function runHtmlPrimary(state) {
   }
 
   const works = extractWorksFromHtml(html);
+  console.log("HTML works:", works.map(w => w.id));
 
   // If HTML parsing yields nothing, try Atom fallback instead of pretending success.
   if (works.length === 0) {
@@ -244,6 +245,7 @@ async function runHtmlPrimary(state) {
   }
 
   const ordered = newWorks.reverse();
+  console.log("HTML will post:", ordered.map(w => w.id));
 
   const chaptersById = new Map();
   if (ordered.length <= DETAILS_THRESHOLD) {
@@ -338,6 +340,7 @@ async function runAtomFallback(state) {
   }
   
   const entries = parseAtom(xml);
+  console.log("ATOM entries:", entries.map(e => e.id));
   
   if (!entries.length) {
     console.log("Atom: 0 entries (empty feed or parse change).");
@@ -372,6 +375,7 @@ async function runAtomFallback(state) {
   }
 
   const ordered = filtered.reverse();
+  console.log("ATOM will post:", ordered.map(e => e.id));
   const lines = ordered.map(buildLineAtom);
 
   await postLinesToDiscord(lines);
