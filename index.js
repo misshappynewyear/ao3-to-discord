@@ -77,11 +77,39 @@ function shouldExcludeByTags(entryTags) {
   return false;
 }
 
+function isHtmlLike(text) {
+  const s = String(text || "").trim().toLowerCase();
+  return (
+    s.startsWith("<!doctype html") ||
+    s.startsWith("<html") ||
+    s.includes("<head") ||
+    s.includes("<body")
+  );
+}
+
+function looksLikeXml(text) {
+  const s = String(text || "").trim();
+  return s.startsWith("<?xml") || s.startsWith("<feed") || s.startsWith("<rss");
+}
+
+function looksLikeAtom(xml) {
+  const s = String(xml || "").trim().toLowerCase();
+  return s.startsWith("<?xml") || s.includes("<feed");
+}
+
 /**
  * Fetch text. Returns:
- * - string: success
- * - null: blocked/unavailable (401/403/418/525) => caller should fallback/skip without updating state
- * Throws on non-retryable errors after retries.
+ * {
+ *   ok: boolean,
+ *   status: number | null,
+ *   text: string | null,
+ *   contentType: string,
+ *   blocked?: boolean,
+ *   skipped?: boolean
+ * }
+ *
+ * Never throws for AO3 transient/unavailable cases.
+ * Only throws for hard non-retryable HTTP failures after retries.
  */
 async function fetchText(url, { accept = "text/html" } = {}) {
   for (let attempt = 1; attempt <= MAX_AO3_ATTEMPTS; attempt++) {
@@ -102,20 +130,38 @@ async function fetchText(url, { accept = "text/html" } = {}) {
         },
       });
 
-      if (res.ok) return await res.text();
+      const contentType = res.headers.get("content-type") || "";
+      const text = await res.text().catch(() => "");
+
+      if (res.ok) {
+        return {
+          ok: true,
+          status: res.status,
+          text,
+          contentType,
+        };
+      }
 
       const retryable = RETRYABLE_HTTP.has(res.status);
       const blocked = BLOCKED_HTTP.has(res.status);
-      const bodySnippet = await res.text().catch(() => "");
 
       console.error(
-        `[AO3] HTTP ${res.status} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} body=${bodySnippet
+        `[AO3] HTTP ${res.status} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} contentType=${contentType} body=${text
           .slice(0, 180)
           .replace(/\s+/g, " ")}`
       );
 
-      // Do not waste time retrying blocked/unavailable cases inside the same run.
-      if (blocked) return null;
+      // Blocked/unavailable => do not fail the workflow
+      if (blocked) {
+        return {
+          ok: false,
+          status: res.status,
+          text,
+          contentType,
+          blocked: true,
+          skipped: true,
+        };
+      }
 
       if (!retryable || attempt === MAX_AO3_ATTEMPTS) {
         throw new Error(`AO3 request failed: ${res.status}`);
@@ -137,8 +183,16 @@ async function fetchText(url, { accept = "text/html" } = {}) {
         `[AO3] ${isAbort ? "TIMEOUT/ABORT" : "ERROR"} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} err=${e?.message || e}`
       );
 
-      // If we already exhausted retries on network timeout/error, skip run cleanly.
-      if (attempt === MAX_AO3_ATTEMPTS) return null;
+      // Exhausted retries => skip cleanly
+      if (attempt === MAX_AO3_ATTEMPTS) {
+        return {
+          ok: false,
+          status: null,
+          text: null,
+          contentType: "",
+          skipped: true,
+        };
+      }
 
       await sleep(backoffForAttempt(attempt));
     } finally {
@@ -146,7 +200,13 @@ async function fetchText(url, { accept = "text/html" } = {}) {
     }
   }
 
-  return null;
+  return {
+    ok: false,
+    status: null,
+    text: null,
+    contentType: "",
+    skipped: true,
+  };
 }
 
 // ---------------- HTML (primary) ----------------
@@ -174,10 +234,10 @@ function extractWorksFromHtml(html) {
 }
 
 async function fetchChapterOnly(id) {
-  const html = await fetchText(`https://archiveofourown.org/works/${id}`, { accept: "text/html" });
-  if (!html) return { chapter: "" };
+  const result = await fetchText(`https://archiveofourown.org/works/${id}`, { accept: "text/html" });
+  if (!result.ok || !result.text) return { chapter: "" };
 
-  const $ = cheerio.load(html);
+  const $ = cheerio.load(result.text);
   let chapter = $("dd.chapters").first().text().trim();
   if (chapter.includes("/")) chapter = `Chapter ${chapter.split("/")[0]}`;
   else chapter = "";
@@ -210,13 +270,20 @@ function buildLineHtml(work, chapter = "") {
 async function runHtmlPrimary(state) {
   if (!AO3_SEARCH_URL) return { handled: false };
 
-  const html = await fetchText(AO3_SEARCH_URL, { accept: "text/html" });
-  if (!html) {
+  const result = await fetchText(AO3_SEARCH_URL, { accept: "text/html" });
+
+  if (!result.ok || !result.text) {
+    console.log("HTML: AO3 unavailable/blocked. Falling back to Atom.");
     return { handled: false, blocked: true };
   }
 
-  const works = extractWorksFromHtml(html);
-  console.log("HTML works:", works.map(w => w.id));
+  if (isHtmlLike(result.text) === false && !String(result.contentType).includes("html")) {
+    console.log(`HTML: unexpected content-type=${result.contentType}. Falling back to Atom.`);
+    return { handled: false };
+  }
+
+  const works = extractWorksFromHtml(result.text);
+  console.log("HTML works:", works.map((w) => w.id));
 
   // If HTML parsing yields nothing, try Atom fallback instead of pretending success.
   if (works.length === 0) {
@@ -245,7 +312,7 @@ async function runHtmlPrimary(state) {
   }
 
   const ordered = newWorks.reverse();
-  console.log("HTML will post:", ordered.map(w => w.id));
+  console.log("HTML will post:", ordered.map((w) => w.id));
 
   const chaptersById = new Map();
   if (ordered.length <= DETAILS_THRESHOLD) {
@@ -274,13 +341,7 @@ async function runHtmlPrimary(state) {
 
 // ---------------- Atom (fallback) ----------------
 
-function looksLikeAtom(xml) {
-  const s = String(xml || "").trim().toLowerCase();
-  return s.startsWith("<?xml") || s.includes("<feed");
-}
-
 function parseAtom(xml) {
-  
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "@_",
@@ -324,28 +385,52 @@ function buildLineAtom(entry) {
 async function runAtomFallback(state) {
   if (!AO3_FEED_URL) return { handled: false };
 
-  const xml = await fetchText(AO3_FEED_URL, {
+  const result = await fetchText(AO3_FEED_URL, {
     accept: "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
   });
-  
-  if (!xml) {
+
+  if (!result.ok || !result.text) {
     console.log("Atom: AO3 blocked/unavailable (401/403/418/525/timeout). Skipping run without updating state.");
     return { handled: true, skipped: true };
   }
-  
-  // 👇 NUEVO CHECK
-  if (!looksLikeAtom(xml)) {
-    console.error("Atom: response is not valid XML/Atom. Skipping.");
+
+  const xml = result.text;
+  const contentType = result.contentType || "";
+
+  // nunca intentes parsear HTML o contenido raro como Atom
+  if (isHtmlLike(xml)) {
+    console.error(`Atom: received HTML instead of XML. content-type=${contentType}. Skipping.`);
+    console.error(xml.slice(0, 300).replace(/\s+/g, " "));
     return { handled: true, skipped: true };
   }
-  
-  const entries = parseAtom(xml);
-  console.log("ATOM entries:", entries.map(e => e.id));
-  
+
+  if (
+    !contentType.includes("xml") &&
+    !contentType.includes("atom") &&
+    !looksLikeXml(xml) &&
+    !looksLikeAtom(xml)
+  ) {
+    console.error(`Atom: response is not valid XML/Atom. content-type=${contentType}. Skipping.`);
+    console.error(xml.slice(0, 300).replace(/\s+/g, " "));
+    return { handled: true, skipped: true };
+  }
+
+  let entries;
+  try {
+    entries = parseAtom(xml);
+  } catch (err) {
+    console.error(`Atom: parse failed. Skipping. err=${err?.message || err}`);
+    console.error(xml.slice(0, 300).replace(/\s+/g, " "));
+    return { handled: true, skipped: true };
+  }
+
+  console.log("ATOM entries:", entries.map((e) => e.id));
+
   if (!entries.length) {
     console.log("Atom: 0 entries (empty feed or parse change).");
     return { handled: true };
   }
+
   const newestId = entries[0].id;
 
   if (!state.lastEntryId) {
@@ -375,7 +460,7 @@ async function runAtomFallback(state) {
   }
 
   const ordered = filtered.reverse();
-  console.log("ATOM will post:", ordered.map(e => e.id));
+  console.log("ATOM will post:", ordered.map((e) => e.id));
   const lines = ordered.map(buildLineAtom);
 
   await postLinesToDiscord(lines);
