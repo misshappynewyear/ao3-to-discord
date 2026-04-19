@@ -3,10 +3,9 @@ import * as cheerio from "cheerio";
 import { XMLParser } from "fast-xml-parser";
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const COBY_WEBHOOK_URL = process.env.COBY_WEBHOOK_URL;
 const AO3_SEARCH_URL = process.env.AO3_SEARCH_URL; // HTML (primary)
 const AO3_FEED_URL = process.env.AO3_FEED_URL; // Atom (fallback)
-
-// Optional: comma-separated tag names to exclude for Atom fallback
 const AO3_EXCLUDE_TAGS = (process.env.AO3_EXCLUDE_TAGS || "")
   .split(",")
   .map((s) => s.trim())
@@ -19,20 +18,19 @@ if (!AO3_SEARCH_URL && !AO3_FEED_URL) {
 }
 
 const STATE_FILE = "./state.json";
+const RUN_STATUS_FILE = "./run_status.json";
 const DETAILS_THRESHOLD = 3;
 const MAX_CONCURRENCY = 2;
+const GITHUB_RUN_ID = String(process.env.GITHUB_RUN_ID || "").trim();
+const GITHUB_RUN_ATTEMPT = Number(process.env.GITHUB_RUN_ATTEMPT || 0);
+const FAILURE_ALERT_THRESHOLD_MS = 24 * 60 * 60 * 1000;
 
-// --- Network tuning ---
 const MAX_AO3_ATTEMPTS = 4;
 const AO3_TIMEOUT_BASE_MS = 30_000;
 const AO3_TIMEOUT_MAX_MS = 90_000;
 const RETRY_BACKOFF_BASE_MS = 1500;
 
-// Retryable transient errors
 const RETRYABLE_HTTP = new Set([429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525]);
-
-// Errors that should NOT break the workflow.
-// We return null and let caller fallback or skip the run without updating state.
 const BLOCKED_HTTP = new Set([401, 403, 418, 525]);
 
 function loadState() {
@@ -45,6 +43,18 @@ function loadState() {
 
 function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function loadRunStatus() {
+  try {
+    return JSON.parse(fs.readFileSync(RUN_STATUS_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function saveRunStatus(status) {
+  fs.writeFileSync(RUN_STATUS_FILE, JSON.stringify(status, null, 2));
 }
 
 function sleep(ms) {
@@ -97,20 +107,6 @@ function looksLikeAtom(xml) {
   return s.startsWith("<?xml") || s.includes("<feed");
 }
 
-/**
- * Fetch text. Returns:
- * {
- *   ok: boolean,
- *   status: number | null,
- *   text: string | null,
- *   contentType: string,
- *   blocked?: boolean,
- *   skipped?: boolean
- * }
- *
- * Never throws for AO3 transient/unavailable cases.
- * Only throws for hard non-retryable HTTP failures after retries.
- */
 async function fetchText(url, { accept = "text/html" } = {}) {
   for (let attempt = 1; attempt <= MAX_AO3_ATTEMPTS; attempt++) {
     const timeoutMs = timeoutForAttempt(attempt);
@@ -151,7 +147,6 @@ async function fetchText(url, { accept = "text/html" } = {}) {
           .replace(/\s+/g, " ")}`
       );
 
-      // Blocked/unavailable => do not fail the workflow
       if (blocked) {
         return {
           ok: false,
@@ -183,7 +178,6 @@ async function fetchText(url, { accept = "text/html" } = {}) {
         `[AO3] ${isAbort ? "TIMEOUT/ABORT" : "ERROR"} (attempt ${attempt}/${MAX_AO3_ATTEMPTS}) timeout=${timeoutMs}ms url=${url} err=${e?.message || e}`
       );
 
-      // Exhausted retries => skip cleanly
       if (attempt === MAX_AO3_ATTEMPTS) {
         return {
           ok: false,
@@ -208,8 +202,6 @@ async function fetchText(url, { accept = "text/html" } = {}) {
     skipped: true,
   };
 }
-
-// ---------------- HTML (primary) ----------------
 
 function extractWorksFromHtml(html) {
   const $ = cheerio.load(html);
@@ -285,7 +277,6 @@ async function runHtmlPrimary(state) {
   const works = extractWorksFromHtml(result.text);
   console.log("HTML works:", works.map((w) => w.id));
 
-  // If HTML parsing yields nothing, try Atom fallback instead of pretending success.
   if (works.length === 0) {
     console.log("AO3 HTML: 0 works found (empty results, blocked page, or layout change). Falling back to Atom.");
     return { handled: false };
@@ -296,7 +287,7 @@ async function runHtmlPrimary(state) {
   if (!state.lastWorkId) {
     saveState({ ...state, lastWorkId: newest });
     console.log(`Initialized HTML state at work ${newest}`);
-    return { handled: true };
+    return { handled: true, modeUsed: "html", postedCount: 0, skipped: false };
   }
 
   const newWorks = [];
@@ -308,7 +299,7 @@ async function runHtmlPrimary(state) {
   if (newWorks.length === 0) {
     saveState({ ...state, lastWorkId: newest });
     console.log("HTML: No new works since last check.");
-    return { handled: true };
+    return { handled: true, modeUsed: "html", postedCount: 0, skipped: false };
   }
 
   const ordered = newWorks.reverse();
@@ -336,10 +327,14 @@ async function runHtmlPrimary(state) {
   saveState({ ...state, lastWorkId: newest });
   console.log(`HTML: Updated state to work ${newest}`);
 
-  return { handled: true };
+  return {
+    handled: true,
+    modeUsed: "html",
+    postedCount: lines.length,
+    postedSomething: lines.length > 0,
+    skipped: false
+  };
 }
-
-// ---------------- Atom (fallback) ----------------
 
 function parseAtom(xml) {
   const parser = new XMLParser({
@@ -391,17 +386,16 @@ async function runAtomFallback(state) {
 
   if (!result.ok || !result.text) {
     console.log("Atom: AO3 blocked/unavailable (401/403/418/525/timeout). Skipping run without updating state.");
-    return { handled: true, skipped: true };
+    return { handled: true, skipped: true, modeUsed: "atom", postedCount: 0 };
   }
 
   const xml = result.text;
   const contentType = result.contentType || "";
 
-  // nunca intentes parsear HTML o contenido raro como Atom
   if (isHtmlLike(xml)) {
     console.error(`Atom: received HTML instead of XML. content-type=${contentType}. Skipping.`);
     console.error(xml.slice(0, 300).replace(/\s+/g, " "));
-    return { handled: true, skipped: true };
+    return { handled: true, skipped: true, modeUsed: "atom", postedCount: 0 };
   }
 
   if (
@@ -412,7 +406,7 @@ async function runAtomFallback(state) {
   ) {
     console.error(`Atom: response is not valid XML/Atom. content-type=${contentType}. Skipping.`);
     console.error(xml.slice(0, 300).replace(/\s+/g, " "));
-    return { handled: true, skipped: true };
+    return { handled: true, skipped: true, modeUsed: "atom", postedCount: 0 };
   }
 
   let entries;
@@ -421,14 +415,14 @@ async function runAtomFallback(state) {
   } catch (err) {
     console.error(`Atom: parse failed. Skipping. err=${err?.message || err}`);
     console.error(xml.slice(0, 300).replace(/\s+/g, " "));
-    return { handled: true, skipped: true };
+    return { handled: true, skipped: true, modeUsed: "atom", postedCount: 0 };
   }
 
   console.log("ATOM entries:", entries.map((e) => e.id));
 
   if (!entries.length) {
     console.log("Atom: 0 entries (empty feed or parse change).");
-    return { handled: true };
+    return { handled: true, modeUsed: "atom", postedCount: 0, skipped: false };
   }
 
   const newestId = entries[0].id;
@@ -436,7 +430,7 @@ async function runAtomFallback(state) {
   if (!state.lastEntryId) {
     saveState({ ...state, lastEntryId: newestId });
     console.log(`Initialized Atom state at entry ${newestId}`);
-    return { handled: true };
+    return { handled: true, modeUsed: "atom", postedCount: 0, skipped: false };
   }
 
   const fresh = [];
@@ -448,7 +442,7 @@ async function runAtomFallback(state) {
   if (!fresh.length) {
     saveState({ ...state, lastEntryId: newestId });
     console.log("Atom: No new entries since last check.");
-    return { handled: true };
+    return { handled: true, modeUsed: "atom", postedCount: 0, skipped: false };
   }
 
   const filtered = fresh.filter((e) => !shouldExcludeByTags(e.tags));
@@ -456,7 +450,7 @@ async function runAtomFallback(state) {
   if (!filtered.length) {
     saveState({ ...state, lastEntryId: newestId });
     console.log("Atom: New entries existed but were excluded. State updated.");
-    return { handled: true };
+    return { handled: true, modeUsed: "atom", postedCount: 0, skipped: false };
   }
 
   const ordered = filtered.reverse();
@@ -468,10 +462,14 @@ async function runAtomFallback(state) {
   saveState({ ...state, lastEntryId: newestId });
   console.log(`Atom: Updated state to entry ${newestId}`);
 
-  return { handled: true };
+  return {
+    handled: true,
+    modeUsed: "atom",
+    postedCount: lines.length,
+    postedSomething: lines.length > 0,
+    skipped: false
+  };
 }
-
-// ---------------- Discord ----------------
 
 async function postToDiscord(message) {
   const maxAttempts = 5;
@@ -507,23 +505,149 @@ async function postLinesToDiscord(lines) {
   }
 }
 
-// ---------------- Main ----------------
+async function sendCobyAlert(content) {
+  if (!COBY_WEBHOOK_URL) {
+    console.warn("Missing COBY_WEBHOOK_URL. Skipping Coby alert.");
+    return;
+  }
+
+  const response = await fetch(COBY_WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ content }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Coby webhook error: ${response.status} - ${text}`);
+  }
+}
+
+function buildAo3ContinuousFailureAlert(errorMessage, startedAtIso) {
+  const startedAt = String(startedAtIso || "").trim() || "an unknown time";
+  const safeError = String(errorMessage || "Unknown error").trim() || "Unknown error";
+
+  return [
+    "CAPTAINS! The AO3 to Discord service has been failing for over 24 hours now...",
+    `It started failing around: ${startedAt}`,
+    "It says:",
+    `> ${safeError}`,
+    "THIS CAN'T BE HAPPENING... I HAVEN'T EVEN FINISHED READING THE FIC YET...",
+    "P-please check what broke before the next chapter disappears too...!"
+  ].join("\n");
+}
+
+function buildSuccessRunStatus(result) {
+  return {
+    runId: GITHUB_RUN_ID,
+    runAttempt: GITHUB_RUN_ATTEMPT,
+    finishedAt: new Date().toISOString(),
+    success: true,
+    skipped: result?.skipped === true,
+    postedSomething: result?.postedSomething === true,
+    postedCount: Number(result?.postedCount || 0),
+    modeUsed: String(result?.modeUsed || "").trim(),
+    failureStreakStartedAt: "",
+    failureAlertedAt: ""
+  };
+}
+
+function buildFailureRunStatus(previousRunStatus, error) {
+  const nowIso = new Date().toISOString();
+  const previousFailed = previousRunStatus?.success === false;
+  const failureStreakStartedAt = previousFailed && previousRunStatus?.failureStreakStartedAt
+    ? String(previousRunStatus.failureStreakStartedAt)
+    : nowIso;
+  const failureAlertedAt = previousFailed && previousRunStatus?.failureAlertedAt
+    ? String(previousRunStatus.failureAlertedAt)
+    : "";
+
+  return {
+    runId: GITHUB_RUN_ID,
+    runAttempt: GITHUB_RUN_ATTEMPT,
+    finishedAt: nowIso,
+    success: false,
+    skipped: false,
+    postedSomething: false,
+    postedCount: 0,
+    modeUsed: "",
+    error: String(error?.message || error),
+    failureStreakStartedAt,
+    failureAlertedAt
+  };
+}
+
+async function maybeAlertContinuousFailure(runStatus) {
+  const startedAtValue = String(runStatus?.failureStreakStartedAt || "").trim();
+  const alertedAtValue = String(runStatus?.failureAlertedAt || "").trim();
+
+  if (!startedAtValue || alertedAtValue) {
+    return runStatus;
+  }
+
+  const startedAtMs = Date.parse(startedAtValue);
+  if (!Number.isFinite(startedAtMs)) {
+    return runStatus;
+  }
+
+  const durationMs = Date.now() - startedAtMs;
+  if (durationMs < FAILURE_ALERT_THRESHOLD_MS) {
+    return runStatus;
+  }
+
+  await sendCobyAlert(
+    buildAo3ContinuousFailureAlert(runStatus.error, runStatus.failureStreakStartedAt)
+  );
+
+  return {
+    ...runStatus,
+    failureAlertedAt: new Date().toISOString()
+  };
+}
 
 async function main() {
   const state = loadState();
 
-  // 1) Try HTML primary
   const htmlResult = await runHtmlPrimary(state);
-  if (htmlResult.handled) return;
+  if (htmlResult.handled) {
+    saveRunStatus(buildSuccessRunStatus(htmlResult));
+    return;
+  }
 
-  // 2) Fallback to Atom
   const atomResult = await runAtomFallback(loadState());
-  if (atomResult.handled) return;
+  if (atomResult.handled) {
+    saveRunStatus(buildSuccessRunStatus(atomResult));
+    return;
+  }
 
+  const finalStatus = {
+    runId: GITHUB_RUN_ID,
+    runAttempt: GITHUB_RUN_ATTEMPT,
+    finishedAt: new Date().toISOString(),
+    success: true,
+    skipped: true,
+    postedSomething: false,
+    postedCount: 0,
+    modeUsed: "",
+    failureStreakStartedAt: "",
+    failureAlertedAt: ""
+  };
+  saveRunStatus(finalStatus);
   console.log("Neither AO3_SEARCH_URL nor AO3_FEED_URL were available to run.");
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
+  try {
+    const previousRunStatus = loadRunStatus();
+    const failedRunStatus = buildFailureRunStatus(previousRunStatus, err);
+    const finalRunStatus = await maybeAlertContinuousFailure(failedRunStatus);
+    saveRunStatus(finalRunStatus);
+  } catch (alertErr) {
+    console.error("Failed sending AO3 continuous failure alert", alertErr);
+  }
+
   console.error(err);
   process.exit(1);
 });
