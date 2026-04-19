@@ -2,6 +2,11 @@ name: AO3 to Discord
 
 on:
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Run even if the AO3 service is disabled"
+        required: false
+        default: "false"
   schedule:
     - cron: "0 13 * * *"
     - cron: "0 1 * * *"
@@ -62,21 +67,24 @@ jobs:
           npm ci --no-audit --no-fund || (sleep 20 && npm ci --no-audit --no-fund)
 
       - name: Run checker
+        if: ${{ vars.AO3_TO_DISCORD_ENABLED != 'false' || github.event.inputs.force_run == 'true' }}
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          COBY_WEBHOOK_URL: ${{ secrets.COBY_WEBHOOK_URL }}
           AO3_SEARCH_URL: ${{ secrets.AO3_SEARCH_URL }}
           AO3_FEED_URL: ${{ secrets.AO3_FEED_URL }}
           AO3_EXCLUDE_TAGS: ${{ secrets.AO3_EXCLUDE_TAGS }}
         run: node index.js
 
       - name: Commit state.json if changed
+        if: always()
         run: |
           if git diff --quiet; then
             echo "No changes to commit."
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state.json
+            git add state.json run_status.json
             git commit -m "Update state"
             git push
           fi
