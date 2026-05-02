@@ -1,12 +1,12 @@
 {
-  "runId": "25243485005",
+  "runId": "25253621676",
   "runAttempt": 1,
-  "finishedAt": "2026-05-02T04:13:51.083Z",
+  "finishedAt": "2026-05-02T14:03:07.095Z",
   "success": true,
-  "skipped": false,
-  "postedSomething": true,
-  "postedCount": 1,
-  "modeUsed": "html",
+  "skipped": true,
+  "postedSomething": false,
+  "postedCount": 0,
+  "modeUsed": "atom",
   "failureStreakStartedAt": "",
   "failureAlertedAt": ""
 }
